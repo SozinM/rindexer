@@ -8,7 +8,8 @@ use ethers::providers::{Http, Provider, RetryClient};
 use ethers::types::U64;
 use rindexer::{
     lazy_static,
-    provider::{create_client, JsonRpcCachedProvider, RetryClientError},
+    manifest::network::ProviderType,
+    provider::{create_client, JsonRpcCachedProvider, ProviderKind, RetryClientError},
     public_read_env_value, HeaderMap,
 };
 
@@ -17,34 +18,36 @@ fn create_shadow_client(
     rpc_url: &str,
     compute_units_per_second: Option<u64>,
     max_block_range: Option<U64>,
-) -> Result<Arc<JsonRpcCachedProvider>, RetryClientError> {
+) -> Result<Arc<ProviderKind>, RetryClientError> {
     let mut header = HeaderMap::new();
     header.insert(
         "X-SHADOW-API-KEY",
         public_read_env_value("RINDEXER_PHANTOM_API_KEY").unwrap().parse().unwrap(),
     );
-    create_client(rpc_url, compute_units_per_second, max_block_range, header)
+    create_client(rpc_url, ProviderType::Rpc, compute_units_per_second, max_block_range, header)
 }
 
 lazy_static! {
-    static ref ETHEREUM_PROVIDER: Arc<JsonRpcCachedProvider> = create_client(
+    static ref ETHEREUM_PROVIDER: Arc<ProviderKind> = create_client(
         &public_read_env_value("https://mainnet.gateway.tenderly.co")
             .unwrap_or("https://mainnet.gateway.tenderly.co".to_string()),
+        ProviderType::Rpc,
         None,
         None,
         HeaderMap::new(),
     )
     .expect("Error creating provider");
-    static ref YOMINET_PROVIDER: Arc<JsonRpcCachedProvider> = create_client(
+    static ref YOMINET_PROVIDER: Arc<ProviderKind> = create_client(
         &public_read_env_value("https://yominet.rpc.caldera.xyz/http")
             .unwrap_or("https://yominet.rpc.caldera.xyz/http".to_string()),
+        ProviderType::Rpc,
         None,
         Some(U64::from(10000)),
         HeaderMap::new(),
     )
     .expect("Error creating provider");
 }
-pub fn get_ethereum_provider_cache() -> Arc<JsonRpcCachedProvider> {
+pub fn get_ethereum_provider_cache() -> Arc<ProviderKind> {
     Arc::clone(&ETHEREUM_PROVIDER)
 }
 
@@ -52,7 +55,7 @@ pub fn get_ethereum_provider() -> Arc<Provider<RetryClient<Http>>> {
     ETHEREUM_PROVIDER.get_inner_provider()
 }
 
-pub fn get_yominet_provider_cache() -> Arc<JsonRpcCachedProvider> {
+pub fn get_yominet_provider_cache() -> Arc<ProviderKind> {
     Arc::clone(&YOMINET_PROVIDER)
 }
 
@@ -60,7 +63,7 @@ pub fn get_yominet_provider() -> Arc<Provider<RetryClient<Http>>> {
     YOMINET_PROVIDER.get_inner_provider()
 }
 
-pub fn get_provider_cache_for_network(network: &str) -> Arc<JsonRpcCachedProvider> {
+pub fn get_provider_cache_for_network(network: &str) -> Arc<ProviderKind> {
     if network == "ethereum" {
         return get_ethereum_provider_cache();
     }

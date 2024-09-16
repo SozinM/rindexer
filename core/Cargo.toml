@@ -62,6 +62,11 @@ serenity = { version = "0.12", features = ["client", "framework"] }
 jemallocator = { version = "0.5.0", optional = true }
 jemalloc-ctl = { version = "0.5.0", optional = true }
 
+hypersync-client = {path="../../hypersync-client-rust/hypersync-client", features = ["ethers"]}
+hypersync-format = {path="../../hypersync-client-rust/hypersync-format", features = ["ethers"]}
+hypersync-net-types = {path="../../hypersync-client-rust/hypersync-net-types"}
+hypersync-schema = {path="../../hypersync-client-rust/hypersync-schema"}
+
 [target.'cfg(not(windows))'.dependencies]
 rdkafka = { version = "0.36", features = ["tokio"] }
 

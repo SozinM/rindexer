@@ -26,7 +26,7 @@ use rindexer::{
         contract::{Contract, ContractDetails},
         yaml::read_manifest,
     },
-    provider::JsonRpcCachedProvider,
+    provider::{JsonRpcCachedProvider, ProviderKind},
     AsyncCsvAppender, FutureExt, PostgresClient,
 };
 
@@ -342,7 +342,7 @@ where
         "RocketPoolETH".to_string()
     }
 
-    fn get_provider(&self, network: &str) -> Arc<JsonRpcCachedProvider> {
+    fn get_provider(&self, network: &str) -> Arc<ProviderKind> {
         get_provider_cache_for_network(network)
     }
 
