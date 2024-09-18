@@ -66,6 +66,7 @@ hypersync-client = {path="../../hypersync-client-rust/hypersync-client", feature
 hypersync-format = {path="../../hypersync-client-rust/hypersync-format", features = ["ethers"]}
 hypersync-net-types = {path="../../hypersync-client-rust/hypersync-net-types"}
 hypersync-schema = {path="../../hypersync-client-rust/hypersync-schema"}
+arrayvec = "0.7.6"
 
 [target.'cfg(not(windows))'.dependencies]
 rdkafka = { version = "0.36", features = ["tokio"] }

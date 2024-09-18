@@ -5,9 +5,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use arrayvec::ArrayVec;
 use ethers::{
     middleware::Middleware,
-    prelude::Log,
+    prelude::{Log, ValueOrArray},
     providers::{Http, Provider, ProviderError, RetryClient, RetryClientBuilder},
     types::{Block, BlockNumber, FilterBlockOption, H256, U256, U64},
 };
@@ -17,7 +18,8 @@ use hypersync_client::{
     to_ethers::TryIntoEthers,
     Client, ClientConfig,
 };
-use hypersync_net_types::{BlockSelection, JoinMode};
+use hypersync_format::{FixedSizeData, LogArgument};
+use hypersync_net_types::{BlockSelection, JoinMode, LogSelection};
 use reqwest::header::HeaderMap;
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -185,7 +187,7 @@ impl HyperSyncProvider {
         let all_log_fields: BTreeSet<String> =
             hypersync_schema::log().fields.iter().map(|x| x.name.clone()).collect();
 
-        let query = match raw_filter.block_option {
+        let mut query = match raw_filter.block_option {
             FilterBlockOption::Range { from_block, to_block } => {
                 let from_block = from_block
                     .map(|n| n.as_number().expect("from_block should be set as a number"))
@@ -215,26 +217,61 @@ impl HyperSyncProvider {
         let addresses = raw_filter
             .address
             .map(|addr| match addr {
-                ethers::types::ValueOrArray::Value(a) => vec![a],
-                ethers::types::ValueOrArray::Array(arr) => arr,
+                ValueOrArray::Value(a) => vec![a],
+                ValueOrArray::Array(arr) => arr,
             })
             .unwrap_or_default();
 
-        // let topics = raw_filter.topics.into_iter().map(|t| t.filter_map(|t| {
-        //     match t {
-        //         ValueOrArray::Value(Some(topic)) => Some(vec![topic.into()]),
-        //         ValueOrArray::Value(None) => None,
-        //         ValueOrArray::Array(topics) => Some(topics.map(Into::into).collect()),
-        //     }
-        // })).collect::<Vec<FixedSizeData<32>>>();
-        //
-        // let log_selection = LogSelection {
-        //     address: addresses.into_iter().map(|a| a.into()).collect(),
-        //     address_filter: None,
-        //     topics: vec![topics].into(),
-        // };
-        //
-        // query.logs = vec![log_selection];
+        let mut topics_array: ArrayVec<_, 4> = ArrayVec::new();
+        for _ in 0..4 {
+            topics_array.push(vec![]);
+        }
+        let mut hypersync_topics: Vec<ArrayVec<Vec<LogArgument>, 4>> = vec![topics_array];
+
+        for (pos, topics) in raw_filter.topics.into_iter().enumerate() {
+            if let Some(topics) = topics {
+                match topics {
+                    ValueOrArray::Value(Some(topic)) => {
+                        for htopic in hypersync_topics.iter_mut() {
+                            htopic[pos].push(topic.into());
+                        }
+                    }
+                    ValueOrArray::Value(None) => {
+                        for htopic in hypersync_topics.iter_mut() {
+                            htopic[pos].push(Default::default());
+                        }
+                    }
+                    // Either topic in this position
+                    // TODO: we shouldn't extend because we have doubling on first iteration
+                    ValueOrArray::Array(topics) => {
+                        let initial_topics = hypersync_topics.clone();
+                        for topic in topics {
+                            if let Some(topic) = topic {
+                                hypersync_topics.extend(
+                                    initial_topics
+                                        .clone()
+                                        .into_iter()
+                                        .map(|mut htopic| {
+                                            htopic[pos].push(topic.into());
+                                            htopic
+                                        })
+                                        .collect::<Vec<_>>(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        query.logs = hypersync_topics
+            .into_iter()
+            .map(|htopics| LogSelection {
+                address: addresses.clone().into_iter().map(|a| a.into()).collect(),
+                address_filter: None,
+                topics: htopics,
+            })
+            .collect();
 
         Ok(self
             .provider
@@ -304,7 +341,7 @@ pub fn create_client(
         ProviderType::Hypersync => {
             let config = ClientConfig {
                 url: Some(url),
-                http_req_timeout_millis: NonZeroU64::new(1000),
+                http_req_timeout_millis: NonZeroU64::new(30000),
                 max_num_retries: 3.into(),
                 ..Default::default()
             };
