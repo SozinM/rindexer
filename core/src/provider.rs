@@ -26,6 +26,7 @@ use tokio::sync::Mutex;
 use url::Url;
 
 use crate::{
+    database::postgres::client::connection_string,
     event::RindexerEventFilter,
     manifest::{core::Manifest, network::ProviderType},
 };
@@ -157,7 +158,8 @@ impl HyperSyncProvider {
 
         let data = self
             .provider
-            .get(&query)
+            .clone()
+            .collect(query, Default::default())
             .await
             .map_err(|err| ProviderError::CustomError(err.to_string()))?;
 
@@ -196,7 +198,7 @@ impl HyperSyncProvider {
                     to_block.map(|n| n.as_number().expect("to_block should be set as a number"));
                 Query {
                     from_block: from_block.as_u64(),
-                    to_block: to_block.map(|n| n.as_u64()),
+                    to_block: to_block.map(|n| n.as_u64() + 1),
                     field_selection: FieldSelection { log: all_log_fields, ..Default::default() },
                     ..Default::default()
                 }
@@ -222,68 +224,47 @@ impl HyperSyncProvider {
             })
             .unwrap_or_default();
 
-        let mut topics_array: ArrayVec<_, 4> = ArrayVec::new();
-        for _ in 0..4 {
-            topics_array.push(vec![]);
-        }
-        let mut hypersync_topics: Vec<ArrayVec<Vec<LogArgument>, 4>> = vec![topics_array];
-
-        for (pos, topics) in raw_filter.topics.into_iter().enumerate() {
-            if let Some(topics) = topics {
-                match topics {
-                    ValueOrArray::Value(Some(topic)) => {
-                        for htopic in hypersync_topics.iter_mut() {
-                            htopic[pos].push(topic.into());
-                        }
-                    }
-                    ValueOrArray::Value(None) => {
-                        for htopic in hypersync_topics.iter_mut() {
-                            htopic[pos].push(Default::default());
-                        }
-                    }
-                    // Either topic in this position
-                    // TODO: we shouldn't extend because we have doubling on first iteration
-                    ValueOrArray::Array(topics) => {
-                        let initial_topics = hypersync_topics.clone();
-                        for topic in topics {
-                            if let Some(topic) = topic {
-                                hypersync_topics.extend(
-                                    initial_topics
-                                        .clone()
-                                        .into_iter()
-                                        .map(|mut htopic| {
-                                            htopic[pos].push(topic.into());
-                                            htopic
-                                        })
-                                        .collect::<Vec<_>>(),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        query.logs = hypersync_topics
+        let hypersync_topics: ArrayVec<Vec<LogArgument>, 4> = raw_filter
+            .topics
             .into_iter()
-            .map(|htopics| LogSelection {
-                address: addresses.clone().into_iter().map(|a| a.into()).collect(),
-                address_filter: None,
-                topics: htopics,
+            .map(|topic| match topic {
+                None => vec![],
+                Some(ValueOrArray::Value(None)) => vec![],
+                Some(ValueOrArray::Value(Some(topic))) => vec![topic.into()],
+                Some(ValueOrArray::Array(topics)) => topics
+                    .into_iter()
+                    .filter_map(|topic| topic.map(Into::into))
+                    .collect::<Vec<FixedSizeData<32>>>(),
             })
-            .collect();
+            .collect::<ArrayVec<Vec<LogArgument>, 4>>();
 
-        Ok(self
+        query.logs = vec![LogSelection {
+            address: addresses.clone().into_iter().map(|a| a.into()).collect(),
+            address_filter: None,
+            topics: hypersync_topics,
+        }];
+
+        query.join_mode = JoinMode::JoinNothing;
+
+        println!("Query: {:?}", query);
+        let resp = self
             .provider
-            .get(&query)
+            .clone()
+            .collect(query, Default::default())
             .await
-            .map_err(|err| ProviderError::CustomError(err.to_string()))?
+            .map_err(|err| ProviderError::CustomError(err.to_string()))?;
+
+        println!("time: {}", resp.total_execution_time);
+        println!("next_block: {}", resp.next_block);
+        let res = Ok(resp
             .data
             .logs
             .into_iter()
             .flatten()
             .filter_map(|log| log.try_into().ok())
-            .collect::<Vec<Log>>())
+            .collect::<Vec<Log>>());
+
+        res
     }
 
     pub async fn get_chain_id(&self) -> Result<U256, ProviderError> {
