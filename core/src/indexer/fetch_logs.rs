@@ -1,10 +1,11 @@
 use std::{error::Error, str::FromStr, sync::Arc};
-
+use std::ops::Deref;
 use ethers::{
     addressbook::Address,
     middleware::MiddlewareError,
     prelude::{BlockNumber, JsonRpcError, Log, ValueOrArray, H256, U64},
 };
+use ethers::core::k256::pkcs8::der::referenced;
 use regex::Regex;
 use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -32,98 +33,114 @@ pub fn fetch_logs_stream(
     let initial_filter = config.to_event_filter().unwrap();
     let contract_address = initial_filter.contract_address();
 
-    tokio::spawn(async move {
-        let snapshot_to_block = initial_filter.get_to_block();
-        let from_block = initial_filter.get_from_block();
-        let mut current_filter = initial_filter;
+    let pr = match config.network_contract.cached_provider.deref() {
+        ProviderKind::Rpc(_) => true,
+        ProviderKind::Hypersync(_) => false,
+    };
+    match pr {
+        true => {
+            tokio::spawn(async move {
+                let snapshot_to_block = initial_filter.get_to_block();
+                let from_block = initial_filter.get_from_block();
+                let mut current_filter = initial_filter;
 
-        // add any max block range limitation before we start processing
-        let mut max_block_range_limitation =
-            config.network_contract.cached_provider.max_block_range();
-        if max_block_range_limitation.is_some() {
-            current_filter = current_filter.set_to_block(calculate_process_historic_log_to_block(
-                &from_block,
-                &snapshot_to_block,
-                &max_block_range_limitation,
-            ));
-            warn!(
+                // add any max block range limitation before we start processing
+                let mut max_block_range_limitation =
+                    config.network_contract.cached_provider.max_block_range();
+                if max_block_range_limitation.is_some() {
+                    current_filter =
+                        current_filter.set_to_block(calculate_process_historic_log_to_block(
+                            &from_block,
+                            &snapshot_to_block,
+                            &max_block_range_limitation,
+                        ));
+                    warn!(
                 "{} - {} - max block range limitation of {} blocks applied - block range indexing will be slower then RPC providers supplying the optimal ranges - https://rindexer.xyz/docs/references/rpc-node-providers#rpc-node-providers",
                 config.info_log_name,
                 IndexingEventProgressStatus::Syncing.log(),
                 max_block_range_limitation.unwrap()
             );
-        }
-        while current_filter.get_from_block() <= snapshot_to_block {
-            let semaphore_client = Arc::clone(&config.semaphore);
-            let permit = semaphore_client.acquire_owned().await;
+                }
+                while current_filter.get_from_block() <= snapshot_to_block {
+                    let semaphore_client = Arc::clone(&config.semaphore);
+                    let permit = semaphore_client.acquire_owned().await;
 
-            match permit {
-                Ok(permit) => {
-                    let result = fetch_historic_logs_stream(
-                        &config.network_contract.cached_provider,
-                        &tx,
-                        &config.topic_id,
-                        current_filter.clone(),
-                        max_block_range_limitation,
-                        snapshot_to_block,
-                        &config.info_log_name,
-                    )
-                    .await;
+                    match permit {
+                        Ok(permit) => {
+                            let result = fetch_historic_logs_stream(
+                                &config.network_contract.cached_provider.clone(),
+                                &tx,
+                                &config.topic_id,
+                                current_filter.clone(),
+                                max_block_range_limitation,
+                                snapshot_to_block,
+                                &config.info_log_name,
+                            )
+                            .await;
 
-                    drop(permit);
+                            drop(permit);
 
-                    // slow indexing warn user
-                    if let Some(range) = max_block_range_limitation {
-                        warn!(
+                            // slow indexing warn user
+                            if let Some(range) = max_block_range_limitation {
+                                warn!(
                             "{} - RPC PROVIDER IS SLOW - Slow indexing mode enabled, max block range limitation: {} blocks - we advise using a faster provider who can predict the next block ranges.",
                             &config.info_log_name,
                             range
                         );
-                    }
+                            }
 
-                    if let Some(result) = result {
-                        current_filter = result.next;
-                        max_block_range_limitation = result.max_block_range_limitation;
-                    } else {
-                        break;
+                            if let Some(result) = result {
+                                current_filter = result.next;
+                                max_block_range_limitation = result.max_block_range_limitation;
+                            } else {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "{} - {} - Semaphore error: {}",
+                                &config.info_log_name,
+                                IndexingEventProgressStatus::Syncing.log(),
+                                e
+                            );
+                            continue;
+                        }
                     }
                 }
-                Err(e) => {
-                    error!(
-                        "{} - {} - Semaphore error: {}",
+
+                info!(
+                    "{} - {} - Finished indexing historic events",
+                    &config.info_log_name,
+                    IndexingEventProgressStatus::Completed.log()
+                );
+
+                // Live indexing mode
+                if config.live_indexing && !force_no_live_indexing {
+                    live_indexing_stream(
+                        &config.network_contract.cached_provider,
+                        &tx,
+                        &contract_address,
+                        &config.topic_id,
+                        &config.indexing_distance_from_head,
+                        current_filter,
                         &config.info_log_name,
-                        IndexingEventProgressStatus::Syncing.log(),
-                        e
-                    );
-                    continue;
+                        &config.semaphore,
+                        config.network_contract.disable_logs_bloom_checks,
+                    )
+                    .await;
                 }
-            }
+            });
+            UnboundedReceiverStream::new(rx)
         }
-
-        info!(
-            "{} - {} - Finished indexing historic events",
-            &config.info_log_name,
-            IndexingEventProgressStatus::Completed.log()
-        );
-
-        // Live indexing mode
-        if config.live_indexing && !force_no_live_indexing {
-            live_indexing_stream(
-                &config.network_contract.cached_provider,
-                &tx,
-                &contract_address,
-                &config.topic_id,
-                &config.indexing_distance_from_head,
-                current_filter,
-                &config.info_log_name,
-                &config.semaphore,
-                config.network_contract.disable_logs_bloom_checks,
-            )
-            .await;
+        false => {
+            tokio::spawn(async move {
+                if let ProviderKind::Hypersync(ref pr) = config.network_contract.cached_provider.deref() {
+                    pr.stream(&tx, initial_filter).await;
+                }
+            });
+            UnboundedReceiverStream::new(rx)
         }
-    });
-
-    UnboundedReceiverStream::new(rx)
+    }
 }
 
 struct ProcessHistoricLogsStreamResult {
@@ -490,18 +507,18 @@ async fn live_indexing_stream(
 }
 
 #[derive(Debug)]
-struct RetryWithBlockRangeResult {
-    from: BlockNumber,
-    to: BlockNumber,
+pub struct RetryWithBlockRangeResult {
+    pub from: BlockNumber,
+    pub to: BlockNumber,
     // This is only populated if you are using an RPC provider
     // who doesn't give block ranges, this tends to be providers
     // which are a lot slower than others, expect these providers
     // to be slow
-    max_block_range: Option<U64>,
+    pub max_block_range: Option<U64>,
 }
 
 /// Attempts to retry with a new block range based on the error message.
-fn retry_with_block_range(
+pub fn retry_with_block_range(
     error: &JsonRpcError,
     from_block: U64,
     to_block: U64,
@@ -605,7 +622,7 @@ fn retry_with_block_range(
     None
 }
 
-fn calculate_process_historic_log_to_block(
+pub fn calculate_process_historic_log_to_block(
     new_from_block: &U64,
     snapshot_to_block: &U64,
     max_block_range_limitation: &Option<U64>,

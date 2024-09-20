@@ -1,14 +1,16 @@
 use std::{
     collections::BTreeSet,
+    error::Error,
     num::NonZeroU64,
+    str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use arrayvec::ArrayVec;
 use ethers::{
-    middleware::Middleware,
-    prelude::{Log, ValueOrArray},
+    middleware::{Middleware, MiddlewareError},
+    prelude::{JsonRpcError, Log, ValueOrArray},
     providers::{Http, Provider, ProviderError, RetryClient, RetryClientBuilder},
     types::{Block, BlockNumber, FilterBlockOption, H256, U256, U64},
 };
@@ -20,14 +22,26 @@ use hypersync_client::{
 };
 use hypersync_format::{FixedSizeData, LogArgument};
 use hypersync_net_types::{BlockSelection, JoinMode, LogSelection};
+use regex::Regex;
 use reqwest::header::HeaderMap;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
+use tokio_stream::{
+    wrappers::{ReceiverStream, UnboundedReceiverStream},
+    StreamExt,
+};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::{
     database::postgres::client::connection_string,
-    event::RindexerEventFilter,
+    event::{config::EventProcessingConfig, RindexerEventFilter},
+    indexer::{
+        fetch_logs::{
+            calculate_process_historic_log_to_block, retry_with_block_range, FetchLogsResult,
+        },
+        IndexingEventProgressStatus,
+    },
     manifest::{core::Manifest, network::ProviderType},
 };
 
@@ -35,6 +49,11 @@ use crate::{
 pub enum ProviderKind {
     Rpc(JsonRpcCachedProvider),
     Hypersync(HyperSyncProvider),
+}
+
+struct ProcessHistoricLogsStreamResult {
+    pub next: RindexerEventFilter,
+    pub max_block_range_limitation: Option<U64>,
 }
 
 impl ProviderKind {
@@ -77,6 +96,43 @@ impl ProviderKind {
         match self {
             Self::Rpc(provider) => provider.max_block_range,
             Self::Hypersync(provider) => provider.max_block_range,
+        }
+    }
+
+    pub async fn fetch_historic_logs_stream(
+        &self,
+        tx: &mpsc::UnboundedSender<Result<FetchLogsResult, Box<dyn Error + Send>>>,
+        topic_id: &H256,
+        current_filter: RindexerEventFilter,
+        max_block_range_limitation: Option<U64>,
+        snapshot_to_block: U64,
+        info_log_name: &str,
+    ) -> Option<ProcessHistoricLogsStreamResult> {
+        match self {
+            Self::Rpc(provider) => {
+                provider
+                    .fetch_historic_logs_stream(
+                        tx,
+                        topic_id,
+                        current_filter,
+                        max_block_range_limitation,
+                        snapshot_to_block,
+                        info_log_name,
+                    )
+                    .await
+            }
+            Self::Hypersync(provider) => {
+                provider
+                    .fetch_historic_logs_stream(
+                        tx,
+                        topic_id,
+                        current_filter,
+                        max_block_range_limitation,
+                        snapshot_to_block,
+                        info_log_name,
+                    )
+                    .await
+            }
         }
     }
 }
@@ -133,6 +189,185 @@ impl JsonRpcCachedProvider {
 
     pub fn get_inner_provider(&self) -> Arc<Provider<RetryClient<Http>>> {
         Arc::clone(&self.provider)
+    }
+
+    async fn fetch_historic_logs_stream(
+        &self,
+        tx: &mpsc::UnboundedSender<Result<FetchLogsResult, Box<dyn Error + Send>>>,
+        topic_id: &H256,
+        current_filter: RindexerEventFilter,
+        max_block_range_limitation: Option<U64>,
+        snapshot_to_block: U64,
+        info_log_name: &str,
+    ) -> Option<ProcessHistoricLogsStreamResult> {
+        let from_block = current_filter.get_from_block();
+        let to_block = current_filter.get_to_block();
+        debug!(
+            "{} - {} - Process historic events - blocks: {} - {}",
+            info_log_name,
+            IndexingEventProgressStatus::Syncing.log(),
+            from_block,
+            to_block
+        );
+
+        if from_block > to_block {
+            debug!(
+                "{} - {} - from_block {:?} > to_block {:?}",
+                info_log_name,
+                IndexingEventProgressStatus::Syncing.log(),
+                from_block,
+                to_block
+            );
+
+            return Some(ProcessHistoricLogsStreamResult {
+                next: current_filter.set_from_block(to_block),
+                max_block_range_limitation,
+            });
+        }
+
+        debug!(
+            "{} - {} - Processing filter: {:?}",
+            info_log_name,
+            IndexingEventProgressStatus::Syncing.log(),
+            current_filter
+        );
+
+        match self.get_logs(&current_filter).await {
+            Ok(logs) => {
+                debug!(
+                    "{} - {} - topic_id {}, Logs: {} from {} to {}",
+                    info_log_name,
+                    IndexingEventProgressStatus::Syncing.log(),
+                    topic_id,
+                    logs.len(),
+                    from_block,
+                    to_block
+                );
+
+                debug!(
+                    "{} - {} - Fetched {} event logs - blocks: {} - {}",
+                    info_log_name,
+                    IndexingEventProgressStatus::Syncing.log(),
+                    logs.len(),
+                    from_block,
+                    to_block
+                );
+
+                let logs_empty = logs.is_empty();
+                // clone here over the full logs way less overhead
+                let last_log = logs.last().cloned();
+
+                if tx.send(Ok(FetchLogsResult { logs, from_block, to_block })).is_err() {
+                    error!(
+                        "{} - {} - Failed to send logs to stream consumer!",
+                        IndexingEventProgressStatus::Syncing.log(),
+                        info_log_name
+                    );
+                    return None;
+                }
+
+                if logs_empty {
+                    info!(
+                        "{} - No events found between blocks {} - {}",
+                        info_log_name, from_block, to_block
+                    );
+                    let next_from_block = to_block + 1;
+                    return if next_from_block > snapshot_to_block {
+                        None
+                    } else {
+                        let new_to_block = calculate_process_historic_log_to_block(
+                            &next_from_block,
+                            &snapshot_to_block,
+                            &max_block_range_limitation,
+                        );
+
+                        debug!(
+                            "{} - {} - new_from_block {:?} new_to_block {:?}",
+                            info_log_name,
+                            IndexingEventProgressStatus::Syncing.log(),
+                            next_from_block,
+                            new_to_block
+                        );
+
+                        Some(ProcessHistoricLogsStreamResult {
+                            next: current_filter
+                                .set_from_block(next_from_block)
+                                .set_to_block(new_to_block),
+                            max_block_range_limitation,
+                        })
+                    };
+                }
+
+                if let Some(last_log) = last_log {
+                    let next_from_block = last_log
+                        .block_number
+                        .expect("block number should always be present in a log") +
+                        U64::from(1);
+                    debug!(
+                        "{} - {} - next_block {:?}",
+                        info_log_name,
+                        IndexingEventProgressStatus::Syncing.log(),
+                        next_from_block
+                    );
+                    return if next_from_block > snapshot_to_block {
+                        None
+                    } else {
+                        let new_to_block = calculate_process_historic_log_to_block(
+                            &next_from_block,
+                            &snapshot_to_block,
+                            &max_block_range_limitation,
+                        );
+
+                        debug!(
+                            "{} - {} - new_from_block {:?} new_to_block {:?}",
+                            info_log_name,
+                            IndexingEventProgressStatus::Syncing.log(),
+                            next_from_block,
+                            new_to_block
+                        );
+
+                        Some(ProcessHistoricLogsStreamResult {
+                            next: current_filter
+                                .set_from_block(next_from_block)
+                                .set_to_block(new_to_block),
+                            max_block_range_limitation,
+                        })
+                    };
+                }
+            }
+            Err(err) => {
+                if let Some(json_rpc_error) = err.as_error_response() {
+                    if let Some(retry_result) =
+                        retry_with_block_range(json_rpc_error, from_block, to_block)
+                    {
+                        debug!(
+                            "{} - {} - Retrying with block range: {:?}",
+                            info_log_name,
+                            IndexingEventProgressStatus::Syncing.log(),
+                            retry_result
+                        );
+                        return Some(ProcessHistoricLogsStreamResult {
+                            next: current_filter
+                                .set_from_block(retry_result.from)
+                                .set_to_block(retry_result.to),
+                            max_block_range_limitation: retry_result.max_block_range,
+                        });
+                    }
+                }
+
+                error!(
+                    "{} - {} - Error fetching logs: {}",
+                    info_log_name,
+                    IndexingEventProgressStatus::Syncing.log(),
+                    err
+                );
+
+                let _ = tx.send(Err(Box::new(err)));
+                return None;
+            }
+        }
+
+        None
     }
 }
 
@@ -277,6 +512,173 @@ impl HyperSyncProvider {
 
     pub fn get_inner_provider(&self) -> Arc<Client> {
         Arc::clone(&self.provider)
+    }
+
+    pub async fn stream(
+        &self,
+        tx: &mpsc::UnboundedSender<Result<FetchLogsResult, Box<dyn Error + Send>>>,
+        filter: RindexerEventFilter,
+    ) {
+        let raw_filter = filter.raw_filter().clone();
+        let mut from_block = raw_filter.get_from_block().unwrap();
+
+        let all_log_fields: BTreeSet<String> =
+            hypersync_schema::log().fields.iter().map(|x| x.name.clone()).collect();
+
+        let mut query = match raw_filter.block_option {
+            FilterBlockOption::Range { from_block, to_block } => {
+                let from_block = from_block
+                    .map(|n| n.as_number().expect("from_block should be set as a number"))
+                    .unwrap_or_default();
+                let to_block =
+                    to_block.map(|n| n.as_number().expect("to_block should be set as a number"));
+                Query {
+                    from_block: from_block.as_u64(),
+                    to_block: to_block.map(|n| n.as_u64() + 1),
+                    field_selection: FieldSelection { log: all_log_fields, ..Default::default() },
+                    ..Default::default()
+                }
+            }
+            FilterBlockOption::AtBlockHash(block_hash) => Query {
+                from_block: 0,
+                to_block: None,
+                blocks: vec![BlockSelection {
+                    hash: vec![block_hash.into()],
+                    ..Default::default()
+                }],
+                field_selection: FieldSelection { log: all_log_fields, ..Default::default() },
+                join_mode: JoinMode::JoinAll,
+                ..Default::default()
+            },
+        };
+
+        let addresses = raw_filter
+            .address
+            .map(|addr| match addr {
+                ValueOrArray::Value(a) => vec![a],
+                ValueOrArray::Array(arr) => arr,
+            })
+            .unwrap_or_default();
+
+        let hypersync_topics: ArrayVec<Vec<LogArgument>, 4> = raw_filter
+            .topics
+            .into_iter()
+            .map(|topic| match topic {
+                None => vec![],
+                Some(ValueOrArray::Value(None)) => vec![],
+                Some(ValueOrArray::Value(Some(topic))) => vec![topic.into()],
+                Some(ValueOrArray::Array(topics)) => topics
+                    .into_iter()
+                    .filter_map(|topic| topic.map(Into::into))
+                    .collect::<Vec<FixedSizeData<32>>>(),
+            })
+            .collect::<ArrayVec<Vec<LogArgument>, 4>>();
+
+        query.logs = vec![LogSelection {
+            address: addresses.clone().into_iter().map(|a| a.into()).collect(),
+            address_filter: None,
+            topics: hypersync_topics,
+        }];
+
+        query.join_mode = JoinMode::JoinNothing;
+
+        let mut res = self.provider.clone().stream(query, Default::default()).await.unwrap();
+
+        while let Some(resp) = res.recv().await {
+            let is_err = resp.is_err();
+            let resp = resp.unwrap();
+            let fl = FetchLogsResult {
+                logs: resp
+                    .data
+                    .logs
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|log| log.try_into().ok())
+                    .collect::<Vec<Log>>(),
+                from_block,
+                to_block: resp.next_block.into(),
+            };
+
+            let r = tx.send(Ok(fl));
+            if r.is_err() {
+                println!("error 12342341234");
+            }
+        }
+    }
+    async fn fetch_historic_logs_stream(
+        &self,
+        tx: &mpsc::UnboundedSender<Result<FetchLogsResult, Box<dyn Error + Send>>>,
+        _topic_id: &H256,
+        current_filter: RindexerEventFilter,
+        _max_block_range_limitation: Option<U64>,
+        _snapshot_to_block: U64,
+        _info_log_name: &str,
+    ) -> Option<ProcessHistoricLogsStreamResult> {
+        let raw_filter = current_filter.raw_filter().clone();
+
+        let all_log_fields: BTreeSet<String> =
+            hypersync_schema::log().fields.iter().map(|x| x.name.clone()).collect();
+
+        let mut query = match raw_filter.block_option {
+            FilterBlockOption::Range { from_block, to_block } => {
+                let from_block = from_block
+                    .map(|n| n.as_number().expect("from_block should be set as a number"))
+                    .unwrap_or_default();
+                let to_block =
+                    to_block.map(|n| n.as_number().expect("to_block should be set as a number"));
+                Query {
+                    from_block: from_block.as_u64(),
+                    to_block: to_block.map(|n| n.as_u64() + 1),
+                    field_selection: FieldSelection { log: all_log_fields, ..Default::default() },
+                    ..Default::default()
+                }
+            }
+            FilterBlockOption::AtBlockHash(block_hash) => Query {
+                from_block: 0,
+                to_block: None,
+                blocks: vec![BlockSelection {
+                    hash: vec![block_hash.into()],
+                    ..Default::default()
+                }],
+                field_selection: FieldSelection { log: all_log_fields, ..Default::default() },
+                join_mode: JoinMode::JoinAll,
+                ..Default::default()
+            },
+        };
+
+        let addresses = raw_filter
+            .address
+            .map(|addr| match addr {
+                ValueOrArray::Value(a) => vec![a],
+                ValueOrArray::Array(arr) => arr,
+            })
+            .unwrap_or_default();
+
+        let hypersync_topics: ArrayVec<Vec<LogArgument>, 4> = raw_filter
+            .topics
+            .into_iter()
+            .map(|topic| match topic {
+                None => vec![],
+                Some(ValueOrArray::Value(None)) => vec![],
+                Some(ValueOrArray::Value(Some(topic))) => vec![topic.into()],
+                Some(ValueOrArray::Array(topics)) => topics
+                    .into_iter()
+                    .filter_map(|topic| topic.map(Into::into))
+                    .collect::<Vec<FixedSizeData<32>>>(),
+            })
+            .collect::<ArrayVec<Vec<LogArgument>, 4>>();
+
+        query.logs = vec![LogSelection {
+            address: addresses.clone().into_iter().map(|a| a.into()).collect(),
+            address_filter: None,
+            topics: hypersync_topics,
+        }];
+
+        query.join_mode = JoinMode::JoinNothing;
+
+        self.provider.clone().stream(query, Default::default());
+
+        panic!("aoeuhtns");
     }
 }
 

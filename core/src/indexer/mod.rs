@@ -8,7 +8,7 @@ mod log_helpers;
 pub use log_helpers::parse_topic;
 mod dependency;
 pub use dependency::ContractEventDependenciesMapFromRelationshipsError;
-mod fetch_logs;
+pub mod fetch_logs;
 mod last_synced;
 pub mod no_code;
 mod reorg;
