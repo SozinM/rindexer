@@ -598,6 +598,7 @@ impl HyperSyncProvider {
                 from_block,
                 to_block: resp.next_block.into(),
             };
+            from_block = resp.next_block.into();
 
             let r = tx.send(Ok(fl));
             if r.is_err() {
